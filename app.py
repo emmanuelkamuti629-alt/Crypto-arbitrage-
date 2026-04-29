@@ -1,165 +1,119 @@
-import asyncio
-import ccxt.async_support as ccxt
-import time
-import threading
-from flask import Flask
-from flask_socketio import SocketIO
-import random
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>Arbitrage Dashboard</title>
+<script src="https://cdn.socket.io/4.5.0/socket.io.min.js"></script>
 
-app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
-
-# =============================
-# CONFIG
-# =============================
-MIN_PROFIT = 0.15
-FEE = 0.0015
-SLEEP = 1
-
-exchanges = {
-    "kucoin": ccxt.kucoin(),
-    "mexc": ccxt.mexc(),
-    "gateio": ccxt.gateio(),
-    "coinex": ccxt.coinex()
+<style>
+body {
+    margin:0;
+    font-family: Arial;
+    background: #0b0f19;
+    color: white;
 }
 
-orderbooks = {}
-symbols = []
+h2 {
+    text-align:center;
+    padding: 15px;
+    color: #00ffcc;
+}
 
-# =============================
-# LOAD SYMBOLS
-# =============================
-async def load_symbols():
-    global symbols
-    common = None
+.container {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    padding: 10px;
+}
 
-    for name, ex in exchanges.items():
-        markets = await ex.load_markets()
+.card {
+    width: 320px;
+    margin: 10px;
+    padding: 15px;
+    border-radius: 12px;
+    background: #111827;
+    box-shadow: 0 0 10px rgba(0,255,200,0.1);
+    transition: 0.3s;
+}
 
-        pairs = {
-            s for s in markets
-            if s.endswith("/USDT") and markets[s]["active"]
-        }
+.card:hover {
+    transform: scale(1.03);
+    box-shadow: 0 0 20px rgba(0,255,200,0.3);
+}
 
-        common = pairs if common is None else common & pairs
+.green {
+    border-left: 5px solid #00ff6a;
+}
 
-    symbols = list(common)
-    print("Loaded symbols:", len(symbols))
+.yellow {
+    border-left: 5px solid #ffcc00;
+}
 
-# =============================
-# WORKER (STABLE STREAM)
-# =============================
-async def worker(ex_name, ex, worker_id):
-    i = worker_id
+.red {
+    border-left: 5px solid #ff4d4d;
+}
 
-    while True:
-        if not symbols:
-            await asyncio.sleep(3)
-            continue
+.symbol {
+    font-size: 18px;
+    font-weight: bold;
+    color: #00d4ff;
+}
 
-        try:
-            sym = symbols[i % len(symbols)]
+.profit {
+    font-size: 20px;
+    font-weight: bold;
+}
 
-            book = await ex.fetch_order_book(sym, 5)
+.small {
+    font-size: 13px;
+    color: #aaa;
+}
+</style>
+</head>
 
-            bids = book["bids"]
-            asks = book["asks"]
+<body>
 
-            if not bids or not asks:
-                continue
+<h2>🔥 Live Arbitrage Scanner</h2>
+<div class="container" id="data"></div>
 
-            orderbooks[(ex_name, sym)] = {
-                "bid": bids[0][0],
-                "bid_vol": bids[0][1],
-                "ask": asks[0][0],
-                "ask_vol": asks[0][1],
-                "time": time.time()
-            }
+<script>
+const socket = io();
 
-            i += 5
+socket.on("update", function(data) {
+    let html = "";
 
-        except:
-            pass
+    if(data.length === 0){
+        html = "<p style='text-align:center;color:#aaa'>No opportunities</p>";
+    }
 
-        await asyncio.sleep(SLEEP + random.uniform(0, 0.5))
+    data.forEach(d => {
 
-# =============================
-# SCANNER (PRO LOGIC)
-# =============================
-def scan():
-    results = []
-    grouped = {}
-    now = time.time()
+        let cls = "red";
+        if(d.net_profit > 1) cls = "green";
+        else if(d.net_profit > 0.6) cls = "yellow";
 
-    for (ex, sym), data in orderbooks.items():
-        grouped.setdefault(sym, {})[ex] = data
+        html += `
+        <div class="card ${cls}">
+            <div class="symbol">${d.symbol}</div>
+            <div>BUY: ${d.buy}</div>
+            <div>SELL: ${d.sell}</div>
 
-    for sym, data in grouped.items():
-        if len(data) < 2:
-            continue
+            <div class="profit">
+                ${d.net_profit}%
+            </div>
 
-        buy_ex = min(data, key=lambda x: data[x]["ask"])
-        sell_ex = max(data, key=lambda x: data[x]["bid"])
+            <div class="small">
+                💧 Buy Liquidity: ${d.buy_liquidity || d.sell_liquidity}<br>
+                🔓 Withdraw: ${d.buy_withdraw}<br>
+                🔐 Deposit: ${d.sell_deposit}
+            </div>
+        </div>`;
+    });
 
-        buy = data[buy_ex]["ask"]
-        sell = data[sell_ex]["bid"]
+    document.getElementById("data").innerHTML = html;
+});
+</script>
 
-        # stale filter
-        if now - data[buy_ex]["time"] > 3:
-            continue
-        if now - data[sell_ex]["time"] > 3:
-            continue
-
-        # liquidity check (PRO FEATURE)
-        if data[buy_ex]["ask_vol"] < 1 or data[sell_ex]["bid_vol"] < 1:
-            continue
-
-        profit = ((sell - buy) / buy) * 100
-        profit -= FEE * 200
-
-        if profit >= MIN_PROFIT:
-            results.append({
-                "symbol": sym,
-                "buy": buy_ex,
-                "sell": sell_ex,
-                "profit": round(profit, 3)
-            })
-
-    return sorted(results, key=lambda x: x["profit"], reverse=True)[:20]
-
-# =============================
-# ENGINE
-# =============================
-async def engine():
-    await load_symbols()
-
-    tasks = []
-
-    for ex_name, ex in exchanges.items():
-        for w in range(3):  # controlled workers
-            tasks.append(worker(ex_name, ex, w))
-
-    await asyncio.gather(*tasks)
-
-# =============================
-# PUSH
-# =============================
-def push():
-    while True:
-        socketio.emit("update", scan())
-        time.sleep(1)
-
-# =============================
-# RUN
-# =============================
-@app.route("/")
-def home():
-    return "PRO ARBITRAGE ENGINE ACTIVE"
-
-if __name__ == "__main__":
-    threading.Thread(target=push, daemon=True).start()
-
-    loop = asyncio.new_event_loop()
-    threading.Thread(target=lambda: loop.run_until_complete(engine()), daemon=True).start()
-
-    socketio.run(app, host="0.0.0.0", port=5000)
+</body>
+</html>
+"""
