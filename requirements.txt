@@ -1,0 +1,6 @@
+flask
+flask-socketio
+gevent
+ccxt
+eventlet
+gunicorn
