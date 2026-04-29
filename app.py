@@ -1,37 +1,21 @@
-from gevent import monkey
-monkey.patch_all()
-
+import asyncio
+import ccxt.async_support as ccxt
 import time
-import ccxt
 import threading
-import os
 from flask import Flask
 from flask_socketio import SocketIO
+import random
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 # =============================
 # CONFIG
 # =============================
-symbols = ["BTC/USDT", "ETH/USDT"]
-
-MIN_PROFIT = 1.2
+MIN_PROFIT = 0.15
 FEE = 0.0015
-MAX_AGE = 2
-COOLDOWN = 6
-RISK_PER_TRADE = 0.02   # 2% capital risk
+SLEEP = 1
 
-ORDERBOOKS = {}
-TRADE_HISTORY = []
-EQUITY = []
-CAPITAL = 1000
-
-TRADE_LOCK = {}
-
-# =============================
-# EXCHANGES
-# =============================
 exchanges = {
     "kucoin": ccxt.kucoin(),
     "mexc": ccxt.mexc(),
@@ -39,104 +23,76 @@ exchanges = {
     "coinex": ccxt.coinex()
 }
 
-# =============================
-# ORDERBOOK
-# =============================
-def update(ex, sym, bid, ask):
-    ORDERBOOKS[f"{ex}:{sym}"] = {
-        "bid": bid,
-        "ask": ask,
-        "time": time.time()
-    }
+orderbooks = {}
+symbols = []
 
 # =============================
-# DATA FEED
+# LOAD SYMBOLS
 # =============================
-def feed():
+async def load_symbols():
+    global symbols
+    common = None
+
+    for name, ex in exchanges.items():
+        markets = await ex.load_markets()
+
+        pairs = {
+            s for s in markets
+            if s.endswith("/USDT") and markets[s]["active"]
+        }
+
+        common = pairs if common is None else common & pairs
+
+    symbols = list(common)
+    print("Loaded symbols:", len(symbols))
+
+# =============================
+# WORKER (STABLE STREAM)
+# =============================
+async def worker(ex_name, ex, worker_id):
+    i = worker_id
+
     while True:
-        for name, ex in exchanges.items():
-            for sym in symbols:
-                try:
-                    t = ex.fetch_ticker(sym)
-                    if t["bid"] and t["ask"]:
-                        update(name, sym, t["bid"], t["ask"])
-                except:
-                    continue
-        time.sleep(0.6)
+        if not symbols:
+            await asyncio.sleep(3)
+            continue
+
+        try:
+            sym = symbols[i % len(symbols)]
+
+            book = await ex.fetch_order_book(sym, 5)
+
+            bids = book["bids"]
+            asks = book["asks"]
+
+            if not bids or not asks:
+                continue
+
+            orderbooks[(ex_name, sym)] = {
+                "bid": bids[0][0],
+                "bid_vol": bids[0][1],
+                "ask": asks[0][0],
+                "ask_vol": asks[0][1],
+                "time": time.time()
+            }
+
+            i += 5
+
+        except:
+            pass
+
+        await asyncio.sleep(SLEEP + random.uniform(0, 0.5))
 
 # =============================
-# POSITION SIZE (REALISTIC)
-# =============================
-def position_size():
-    return CAPITAL * RISK_PER_TRADE
-
-# =============================
-# TRADE EXECUTION (SIMULATED)
-# =============================
-def record_trade(symbol, buy_ex, sell_ex, buy, sell):
-    global CAPITAL
-
-    size = position_size()
-
-    entry_cost = size
-    exit_value = size * (sell / buy)
-
-    gross = exit_value - entry_cost
-    fees = (entry_cost + exit_value) * FEE
-
-    net = gross - fees
-
-    CAPITAL += net
-    EQUITY.append(CAPITAL)
-
-    trade = {
-        "symbol": symbol,
-        "buy": buy_ex,
-        "sell": sell_ex,
-        "buy_price": buy,
-        "sell_price": sell,
-        "size": round(size, 2),
-        "net": round(net, 4),
-        "capital": round(CAPITAL, 2),
-        "time": time.time()
-    }
-
-    TRADE_HISTORY.append(trade)
-    return trade
-
-# =============================
-# STATS
-# =============================
-def stats():
-    if not TRADE_HISTORY:
-        return {}
-
-    wins = sum(1 for t in TRADE_HISTORY if t["net"] > 0)
-    losses = len(TRADE_HISTORY) - wins
-    total = sum(t["net"] for t in TRADE_HISTORY)
-
-    return {
-        "trades": len(TRADE_HISTORY),
-        "wins": wins,
-        "losses": losses,
-        "win_rate": round((wins / len(TRADE_HISTORY)) * 100, 2),
-        "profit": round(total, 2),
-        "capital": round(CAPITAL, 2)
-    }
-
-# =============================
-# ARBITRAGE ENGINE (SAFE)
+# SCANNER (PRO LOGIC)
 # =============================
 def scan():
-    global TRADE_LOCK
-
-    grouped = {}
     results = []
+    grouped = {}
     now = time.time()
 
-    for k, v in ORDERBOOKS.items():
-        ex, sym = k.split(":")
-        grouped.setdefault(sym, {})[ex] = v
+    for (ex, sym), data in orderbooks.items():
+        grouped.setdefault(sym, {})[ex] = data
 
     for sym, data in grouped.items():
         if len(data) < 2:
@@ -145,47 +101,45 @@ def scan():
         buy_ex = min(data, key=lambda x: data[x]["ask"])
         sell_ex = max(data, key=lambda x: data[x]["bid"])
 
-        b = data[buy_ex]
-        s = data[sell_ex]
+        buy = data[buy_ex]["ask"]
+        sell = data[sell_ex]["bid"]
 
-        if now - b["time"] > MAX_AGE or now - s["time"] > MAX_AGE:
+        # stale filter
+        if now - data[buy_ex]["time"] > 3:
+            continue
+        if now - data[sell_ex]["time"] > 3:
             continue
 
-        buy = b["ask"]
-        sell = s["bid"]
-
-        if sell <= buy:
+        # liquidity check (PRO FEATURE)
+        if data[buy_ex]["ask_vol"] < 1 or data[sell_ex]["bid_vol"] < 1:
             continue
 
         profit = ((sell - buy) / buy) * 100
-        profit -= (FEE * 200)
+        profit -= FEE * 200
 
-        if profit < MIN_PROFIT:
-            continue
+        if profit >= MIN_PROFIT:
+            results.append({
+                "symbol": sym,
+                "buy": buy_ex,
+                "sell": sell_ex,
+                "profit": round(profit, 3)
+            })
 
-        # 🔒 BIDIRECTIONAL COOLDOWN LOCK
-        key = f"{sym}:{buy_ex}:{sell_ex}"
-        reverse_key = f"{sym}:{sell_ex}:{buy_ex}"
+    return sorted(results, key=lambda x: x["profit"], reverse=True)[:20]
 
-        if (key in TRADE_LOCK and now - TRADE_LOCK[key] < COOLDOWN) or \
-           (reverse_key in TRADE_LOCK and now - TRADE_LOCK[reverse_key] < COOLDOWN):
-            continue
+# =============================
+# ENGINE
+# =============================
+async def engine():
+    await load_symbols()
 
-        TRADE_LOCK[key] = now
+    tasks = []
 
-        trade = record_trade(sym, buy_ex, sell_ex, buy, sell)
+    for ex_name, ex in exchanges.items():
+        for w in range(3):  # controlled workers
+            tasks.append(worker(ex_name, ex, w))
 
-        results.append({
-            "symbol": sym,
-            "buy": buy_ex,
-            "sell": sell_ex,
-            "profit": round(profit, 3),
-            "net": trade["net"],
-            "capital": trade["capital"],
-            "size": trade["size"]
-        })
-
-    return sorted(results, key=lambda x: x["profit"], reverse=True)
+    await asyncio.gather(*tasks)
 
 # =============================
 # PUSH
@@ -193,89 +147,19 @@ def scan():
 def push():
     while True:
         socketio.emit("update", scan())
-        socketio.emit("stats", stats())
-        socketio.emit("equity", EQUITY[-50:])
         time.sleep(1)
 
-threading.Thread(target=feed, daemon=True).start()
-threading.Thread(target=push, daemon=True).start()
-
 # =============================
-# UI
+# RUN
 # =============================
-HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<script src="https://cdn.socket.io/4.5.0/socket.io.min.js"></script>
-</head>
-<body style="background:#000;color:#0f0;font-family:Arial;padding:20px">
-
-<h2>🔥 PRO ARBITRAGE SIMULATOR</h2>
-
-<div id="stats"></div>
-<hr>
-<div id="data"></div>
-<hr>
-<canvas id="chart" width="600" height="200"></canvas>
-
-<script>
-const socket = io();
-
-socket.on("stats", s => {
-document.getElementById("stats").innerHTML = `
-TRADES: ${s.trades||0} |
-WIN RATE: ${s.win_rate||0}% |
-PROFIT: ${s.profit||0} |
-CAPITAL: ${s.capital||1000}
-`;
-});
-
-socket.on("update", data => {
-let html = "";
-data.forEach(x => {
-html += `
-<div style="margin:10px;padding:10px;border:1px solid #333">
-${x.symbol}<br>
-BUY: ${x.buy} → SELL: ${x.sell}<br>
-PROFIT: <b>${x.profit}%</b><br>
-NET: ${x.net}<br>
-SIZE: ${x.size}
-</div>`;
-});
-document.getElementById("data").innerHTML = html;
-});
-
-socket.on("equity", eq => {
-const c = document.getElementById("chart");
-const ctx = c.getContext("2d");
-
-ctx.clearRect(0,0,600,200);
-ctx.beginPath();
-
-if(eq.length < 2) return;
-
-let min = Math.min(...eq);
-let max = Math.max(...eq);
-
-for(let i=0;i<eq.length;i++){
-let x = i * 10;
-let y = 200 - ((eq[i]-min)/(max-min+0.0001))*200;
-ctx.lineTo(x,y);
-}
-
-ctx.strokeStyle = "#0f0";
-ctx.stroke();
-});
-</script>
-
-</body>
-</html>
-"""
-
 @app.route("/")
 def home():
-    return HTML
+    return "PRO ARBITRAGE ENGINE ACTIVE"
 
 if __name__ == "__main__":
-    socketio.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    threading.Thread(target=push, daemon=True).start()
+
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=lambda: loop.run_until_complete(engine()), daemon=True).start()
+
+    socketio.run(app, host="0.0.0.0", port=5000)
