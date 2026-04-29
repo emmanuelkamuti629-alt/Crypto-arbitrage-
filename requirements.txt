@@ -1,6 +1,8 @@
 flask
 flask-socketio
-gevent
-ccxt
 eventlet
-gunicorn
+ccxt
+aiohttp
+asyncio
+gevent
+gevent-websocket
